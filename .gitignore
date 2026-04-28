@@ -1,0 +1,16 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller build folders
+build/
+dist/
+*.spec
+
+# FontDrop specific
+install_history.json
+
+# OS generated files
+.DS_Store
+Thumbs.db
