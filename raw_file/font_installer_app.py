@@ -31,10 +31,41 @@ import zipfile
 import io
 import base64
 import time
+import ctypes
 from datetime import datetime
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import unquote, urlparse, parse_qs
+
+# ── Auto-elevate to Administrator on Windows ────────────────────────────────────
+def _is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except Exception:
+        return False
+
+def _relaunch_as_admin():
+    """Re-launch this script/exe as Administrator via UAC prompt."""
+    try:
+        executable = sys.executable
+        params = " ".join(f'"{a}"' for a in sys.argv)
+        # ShellExecute with 'runas' triggers UAC
+        ret = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", executable, params, None, 1
+        )
+        # ret <= 32 means failure (user cancelled UAC or error)
+        if ret <= 32:
+            return False
+        return True
+    except Exception:
+        return False
+
+if sys.platform == "win32" and not _is_admin():
+    # Try to re-launch elevated; if user cancels UAC we continue without admin
+    relaunched = _relaunch_as_admin()
+    if relaunched:
+        sys.exit(0)   # original process exits; elevated copy takes over
+    # If UAC was cancelled or failed, fall through and run without admin rights
 
 # ── Font extensions we care about ──────────────────────────────────────────────
 FONT_EXTENSIONS = {'.ttf', '.otf', '.woff', '.woff2', '.fon', '.fnt', '.eot', '.pfb', '.pfm'}
@@ -125,7 +156,7 @@ def list_installed_fonts():
 def uninstall_font(font_name: str, location: str):
     if sys.platform != "win32":
         return {"success": False, "error": "Windows only"}
-    import ctypes, winreg
+    import winreg
 
     hkey     = winreg.HKEY_LOCAL_MACHINE if location == "system" else winreg.HKEY_CURRENT_USER
     reg_path = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"
@@ -208,14 +239,10 @@ def zip_bytes_for(source_name: str):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _do_install(fonts_to_install: list, dest_dir: Path, use_registry_hkey):
-    """
-    Core install loop. Returns results dict.
-    use_registry_hkey: winreg constant or None (user-only path skips HKLM).
-    """
     if sys.platform != "win32":
         return {"success": [], "failed": [{"name": "–", "reason": "Windows only"}], "skipped": []}
 
-    import ctypes, winreg
+    import winreg
 
     dest_dir.mkdir(parents=True, exist_ok=True)
     reg_path = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"
@@ -259,15 +286,28 @@ def _do_install(fonts_to_install: list, dest_dir: Path, use_registry_hkey):
     return results
 
 
-def install_fonts_windows(fonts_to_install: list):
+def install_fonts_windows(fonts_to_install: list, scope: str = "system"):
+    """Install fonts. scope='system' → C:/Windows/Fonts (needs admin). scope='user' → user fonts dir."""
     import winreg
-    return _do_install(fonts_to_install, WINDOWS_FONTS_DIR, winreg.HKEY_LOCAL_MACHINE)
+    if scope == "user":
+        user_dir = Path.home() / "AppData" / "Local" / "Microsoft" / "Windows" / "Fonts"
+        return _do_install(fonts_to_install, user_dir, winreg.HKEY_CURRENT_USER)
+    else:
+        return _do_install(fonts_to_install, WINDOWS_FONTS_DIR, winreg.HKEY_LOCAL_MACHINE)
 
 
-def install_fonts_fallback(fonts_to_install: list):
-    import winreg
-    user_dir = Path.home() / "AppData" / "Local" / "Microsoft" / "Windows" / "Fonts"
-    return _do_install(fonts_to_install, user_dir, winreg.HKEY_CURRENT_USER)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Admin status check
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def get_admin_status():
+    if sys.platform != "win32":
+        return {"is_admin": False, "platform": "non-windows"}
+    try:
+        is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+        return {"is_admin": is_admin}
+    except Exception:
+        return {"is_admin": False}
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -275,11 +315,7 @@ def install_fonts_fallback(fonts_to_install: list):
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def parse_multipart_zips(content_type: str, body: bytes):
-    """
-    Returns list of (filename, zip_bytes) for every .zip part found.
-    """
-    import re  # Imported here for safety
-
+    import re
     boundary = content_type.split("boundary=")[-1].strip().encode()
     parts    = body.split(b"--" + boundary)
     results  = []
@@ -287,28 +323,21 @@ def parse_multipart_zips(content_type: str, body: bytes):
     for part in parts:
         if b'filename=' not in part or b'.zip' not in part:
             continue
-            
         header_end = part.find(b"\r\n\r\n")
         if header_end == -1:
             continue
-            
         headers_raw = part[:header_end].decode(errors="replace")
         data        = part[header_end + 4:].rstrip(b"\r\n--")
-        
-        # 100% Bulletproof Regex extraction
-        # This looks specifically for: filename="EXACT_NAME.zip"
         match = re.search(r'filename="([^"]+)"', headers_raw)
-        
         if match:
             fname = match.group(1)
         else:
-            # Fallback just in case the browser doesn't send quotes
             match = re.search(r'filename=([^\s;]+)', headers_raw)
             fname = match.group(1) if match else "unknown.zip"
-            
         results.append((fname, data))
-        
     return results
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # HTML UI
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -410,6 +439,42 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .tagline { color: var(--muted); font-size: 0.72rem; letter-spacing: 0.1em; margin-top: 2px; }
 
+  /* ── Admin badge ── */
+  .admin-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 0.68rem;
+    padding: 3px 9px;
+    border-radius: 20px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    margin-top: 4px;
+    border: 1px solid transparent;
+    transition: all 0.3s;
+  }
+  .admin-badge.is-admin {
+    background: rgba(77,250,160,0.1);
+    border-color: rgba(77,250,160,0.3);
+    color: var(--success);
+  }
+  .admin-badge.no-admin {
+    background: rgba(250,204,77,0.1);
+    border-color: rgba(250,204,77,0.3);
+    color: var(--warn);
+    cursor: pointer;
+  }
+  .admin-badge.no-admin:hover {
+    background: rgba(250,204,77,0.2);
+  }
+
+  .header-right {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+
   .theme-toggle {
     background: var(--surface);
     border: 1px solid var(--border);
@@ -430,6 +495,94 @@ HTML_PAGE = r"""<!DOCTYPE html>
     font-family: 'DM Mono', monospace;
   }
   .theme-btn.active { background: var(--accent); color: #fff; }
+
+  /* ── Scope Toggle ── */
+  .scope-toggle-wrap {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 8px 14px;
+    margin-bottom: 14px;
+    flex-wrap: wrap;
+  }
+  .scope-label {
+    font-size: 0.72rem;
+    color: var(--muted);
+    white-space: nowrap;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+  }
+  .scope-options {
+    display: flex;
+    gap: 4px;
+  }
+  .scope-btn {
+    font-family: 'DM Mono', monospace;
+    font-size: 0.72rem;
+    padding: 5px 14px;
+    border-radius: 7px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    transition: all 0.18s;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    white-space: nowrap;
+  }
+  .scope-btn:hover { border-color: var(--accent); color: var(--text); }
+  .scope-btn.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+    font-weight: 600;
+  }
+  .scope-btn.scope-user.active {
+    background: var(--warn);
+    border-color: var(--warn);
+    color: #1a1a00;
+  }
+  .scope-hint {
+    font-size: 0.66rem;
+    color: var(--muted);
+    margin-left: 4px;
+  }
+  .scope-hint.warn { color: var(--warn); }
+  .scope-hint.ok   { color: var(--success); }
+
+  /* ── Keyboard shortcut hint bar ── */
+  .kbd-hint-bar {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    padding: 7px 0 10px;
+    margin-bottom: 2px;
+    border-bottom: 1px solid var(--border);
+    margin-top: -4px;
+  }
+  .kbd-hint {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 0.65rem;
+    color: var(--muted);
+  }
+  kbd {
+    display: inline-block;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-family: 'DM Mono', monospace;
+    font-size: 0.62rem;
+    color: var(--text);
+    box-shadow: 0 1px 0 var(--border);
+    line-height: 1.5;
+  }
 
   /* ── Tabs ── */
   .tabs {
@@ -486,7 +639,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
     content: ''; 
     position: absolute; 
     inset: -50%;
-    /* Complex conic gradient that we will blur heavily */
     background: conic-gradient(from 180deg at 50% 50%, rgba(124,109,250,0.15) 0deg, rgba(250,109,154,0.15) 180deg, rgba(124,109,250,0.15) 360deg);
     filter: blur(60px);
     opacity: 0;
@@ -515,7 +667,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .drop-zone.drag-over::before { opacity: 1; }
   .drop-zone.drag-over .drop-content { transform: translateY(-6px) scale(1.02); }
 
-  /* Content wrapper for z-indexing above Aurora */
   .drop-content {
     position: relative; 
     z-index: 2; 
@@ -543,7 +694,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .drop-sub { color: var(--muted); font-size: 0.78rem; position: relative; z-index: 2; }
   .drop-sub strong { color: var(--accent); cursor: pointer; text-decoration: underline; }
 
-  /* ✨ PREMIUM BADGE STYLING ✨ */
   .badge-multi {
     background: linear-gradient(135deg, rgba(255,255,255,0.03), rgba(255,255,255,0.01));
     border: 1px solid rgba(255, 255, 255, 0.06);
@@ -780,6 +930,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .font-item:hover .hover-preview-tip { display: block; }
 
+  /* ── Keyboard focus ring for font items ── */
+  .font-item:focus {
+    outline: none;
+    box-shadow: inset 0 0 0 2px var(--accent);
+    background: var(--surface2);
+  }
+  .font-item.kb-focused {
+    box-shadow: inset 0 0 0 2px var(--accent);
+    background: rgba(124,109,250,0.1);
+  }
+
   /* ── Scanning ── */
   .scan-overlay { display: none; text-align: center; padding: 48px; }
   .scan-overlay.active { display: block; }
@@ -893,6 +1054,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     cursor: pointer;
     transition: background 0.1s;
     user-select: none;
+    outline: none;
   }
   .font-item:last-child { border-bottom: none; }
   .font-item:hover { background: var(--surface2); }
@@ -956,82 +1118,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .preview-btn:hover { border-color: var(--accent); color: var(--accent); }
   .preview-btn.active-eye { border-color: var(--accent); color: var(--accent); background: rgba(124,109,250,0.12); }
-
-  /* ── Preview modal ── */
-  .preview-modal {
-    display: none;
-    position: fixed;
-    inset: 0;
-    background: rgba(0,0,0,0.65);
-    z-index: 1000;
-    align-items: center;
-    justify-content: center;
-    padding: 20px;
-  }
-  .preview-modal.active { display: flex; }
-  .preview-content {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 16px;
-    max-width: 700px;
-    width: 100%;
-    padding: 28px;
-    position: relative;
-    animation: fadeIn 0.15s ease;
-  }
-  @keyframes fadeIn { from { opacity:0; transform:scale(0.97); } to { opacity:1; transform:scale(1); } }
-  .preview-close {
-    position: absolute; top: 14px; right: 16px;
-    font-size: 1.4rem; cursor: pointer; color: var(--muted);
-    background: none; border: none;
-  }
-  .preview-close:hover { color: var(--text); }
-  .preview-title {
-    font-family: 'Syne', sans-serif;
-    font-size: 1rem;
-    font-weight: 700;
-    margin-bottom: 6px;
-  }
-  .preview-sub { font-size: 0.68rem; color: var(--muted); margin-bottom: 16px; }
-  .preview-text-input {
-    width: 100%;
-    margin-bottom: 12px;
-    padding: 8px 12px;
-    border-radius: 8px;
-    border: 1px solid var(--border);
-    background: var(--surface2);
-    color: var(--text);
-    font-family: 'DM Mono', monospace;
-    font-size: 0.76rem;
-    outline: none;
-  }
-  .preview-text-input:focus { border-color: var(--accent); }
-  .preview-display {
-    font-size: 2rem;
-    line-height: 1.45;
-    padding: 22px;
-    background: var(--surface2);
-    border-radius: 10px;
-    word-break: break-word;
-    min-height: 80px;
-    border: 1px solid var(--border);
-  }
-  .preview-sizes {
-    display: flex;
-    gap: 6px;
-    margin-top: 10px;
-    flex-wrap: wrap;
-  }
-  .size-btn {
-    font-size: 0.68rem;
-    padding: 3px 9px;
-    border-radius: 6px;
-    border: 1px solid var(--border);
-    background: var(--surface2);
-    color: var(--muted);
-    cursor: pointer;
-  }
-  .size-btn.active { border-color: var(--accent); color: var(--accent); }
 
   /* ── Bottom bar ── */
   .bottom-bar {
@@ -1128,12 +1214,45 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .history-source { font-size: 0.78rem; font-weight: 600; color: var(--accent); }
   .history-date   { font-size: 0.68rem; color: var(--muted); }
   .history-fonts  { font-size: 0.71rem; color: var(--text); opacity: 0.75; line-height: 1.5; }
+  .history-scope-tag {
+    font-size: 0.62rem;
+    padding: 1px 7px;
+    border-radius: 5px;
+    margin-left: 8px;
+    font-weight: 600;
+  }
+  .history-scope-tag.system { background: rgba(109,250,189,0.12); color: var(--accent3); }
+  .history-scope-tag.user   { background: rgba(250,204,77,0.12);  color: var(--warn); }
 
   .empty-state {
     padding: 48px;
     text-align: center;
     color: var(--muted);
     font-size: 0.8rem;
+  }
+
+  /* ── Toast notification ── */
+  .toast {
+    position: fixed;
+    bottom: 28px;
+    left: 50%;
+    transform: translateX(-50%) translateY(12px);
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 9px 18px;
+    font-size: 0.73rem;
+    color: var(--text);
+    opacity: 0;
+    transition: opacity 0.2s, transform 0.2s;
+    z-index: 9999;
+    pointer-events: none;
+    white-space: nowrap;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+  }
+  .toast.show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
   }
 </style>
 </head>
@@ -1144,10 +1263,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div>
       <div class="logo">FontDrop</div>
       <div class="tagline">ZIP FONT INSTALLER · DESKTOP</div>
+      <div class="admin-badge no-admin" id="admin-badge" onclick="requestAdmin()" title="Click to re-launch as Administrator">
+        ⚠ Not running as Administrator
+      </div>
     </div>
-    <div class="theme-toggle">
-      <button class="theme-btn active" id="btn-dark"  onclick="setTheme('dark')">🌙 Dark</button>
-      <button class="theme-btn"        id="btn-light" onclick="setTheme('light')">☀️ Light</button>
+    <div class="header-right">
+      <div class="theme-toggle">
+        <button class="theme-btn active" id="btn-dark"  onclick="setTheme('dark')">🌙 Dark</button>
+        <button class="theme-btn"        id="btn-light" onclick="setTheme('light')">☀️ Light</button>
+      </div>
     </div>
   </div>
 
@@ -1180,6 +1304,32 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
 
     <div id="results" class="results-panel">
+
+      <!-- ── Install Scope Toggle ── -->
+      <div class="scope-toggle-wrap" id="scope-toggle-wrap">
+        <span class="scope-label">INSTALL FOR</span>
+        <div class="scope-options">
+          <button class="scope-btn scope-system active" id="scope-system-btn" onclick="setScope('system')">
+            🔒 All Users <span style="font-size:0.62rem;opacity:0.7;">(C:\Windows\Fonts)</span>
+          </button>
+          <button class="scope-btn scope-user" id="scope-user-btn" onclick="setScope('user')">
+            👤 Current User <span style="font-size:0.62rem;opacity:0.7;">(AppData)</span>
+          </button>
+        </div>
+        <span class="scope-hint" id="scope-hint">Requires Administrator</span>
+      </div>
+
+      <!-- ── Keyboard shortcut hints ── -->
+      <div class="kbd-hint-bar">
+        <span class="kbd-hint"><kbd>Space</kbd> toggle selected</span>
+        <span class="kbd-hint"><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+        <span class="kbd-hint"><kbd>Ctrl</kbd>+<kbd>A</kbd> select all</span>
+        <span class="kbd-hint"><kbd>Ctrl</kbd>+<kbd>D</kbd> deselect all</span>
+        <span class="kbd-hint"><kbd>Enter</kbd> install selected</span>
+        <span class="kbd-hint"><kbd>P</kbd> pin preview</span>
+        <span class="kbd-hint"><kbd>Esc</kbd> close preview</span>
+      </div>
+
       <div class="results-header">
         <div class="results-info">Found <span id="font-count">0</span> fonts</div>
         <div class="toolbar">
@@ -1205,7 +1355,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                placeholder="Preview text…" />
       </div>
 
-      <div class="font-list-wrap">
+      <div class="font-list-wrap" id="font-list-wrap">
         <div id="font-list"></div>
       </div>
 
@@ -1233,7 +1383,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="install-progress-status" id="progress-status">Preparing…</div>
       </div>
     </div>
-  </div><div class="tab-content" id="installed-tab">
+  </div>
+
+  <div class="tab-content" id="installed-tab">
     <div class="results-header">
       <div class="results-info">Installed: <span id="installed-count">…</span></div>
       <div class="toolbar">
@@ -1254,32 +1406,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div id="history-list"><div class="empty-state">Loading…</div></div>
   </div>
 
-</div><div class="preview-modal" id="preview-modal" onclick="closePreview(event)">
-  <div class="preview-content" onclick="event.stopPropagation()">
-    <button class="preview-close" onclick="closePreview()">×</button>
-    <div class="preview-title" id="preview-font-name">—</div>
-    <div class="preview-sub" id="preview-font-sub"></div>
-    <input type="text" class="preview-text-input" id="preview-text-input"
-           value="The quick brown fox jumps over the lazy dog"
-           oninput="updatePreviewText()" />
-    <div class="preview-display" id="preview-display">Loading…</div>
-    <div class="preview-sizes">
-      <span style="font-size:0.68rem; color:var(--muted); margin-right:4px;">Size:</span>
-      <button class="size-btn" onclick="setPreviewSize(24)">24</button>
-      <button class="size-btn active" onclick="setPreviewSize(32)">32</button>
-      <button class="size-btn" onclick="setPreviewSize(48)">48</button>
-      <button class="size-btn" onclick="setPreviewSize(64)">64</button>
-      <button class="size-btn" onclick="setPreviewSize(96)">96</button>
-    </div>
-  </div>
 </div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
 
 <script>
 // ════════════════════════════════════════════════════════════
 // State
 // ════════════════════════════════════════════════════════════
 let allFonts       = [];
-let selectedFonts  = new Set();   // indices into allFonts
+let selectedFonts  = new Set();
 let searchQuery    = '';
 let installedFonts = [];
 let installedSearch= '';
@@ -1287,9 +1424,24 @@ let loadedZipNames = [];
 let previewFontIdx = null;
 let previewSize    = 32;
 let previewFontLoaded = false;
-let pinnedPreviewIdx  = null;   // index of font with open inline panel
-let pinnedPanelHTML   = '';     // saved HTML to restore after re-render
-let pinnedPanelSize   = 32;     // size chosen in open panel
+let pinnedPreviewIdx  = null;
+let pinnedPanelHTML   = '';
+let pinnedPanelSize   = 32;
+let kbFocusedIdx      = null;   // keyboard-navigated font index (into visible list)
+let installScope      = 'system'; // 'system' or 'user'
+let isAdmin           = false;
+
+// ════════════════════════════════════════════════════════════
+// Toast
+// ════════════════════════════════════════════════════════════
+let _toastTimer;
+function showToast(msg, duration=2000) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => t.classList.remove('show'), duration);
+}
 
 // ════════════════════════════════════════════════════════════
 // Theme
@@ -1301,6 +1453,72 @@ function setTheme(t) {
   localStorage.setItem('fd-theme', t);
 }
 (function(){ const t = localStorage.getItem('fd-theme'); if(t) setTheme(t); })();
+
+// ════════════════════════════════════════════════════════════
+// Admin status
+// ════════════════════════════════════════════════════════════
+async function checkAdminStatus() {
+  try {
+    const res  = await fetch('/admin-status');
+    const data = await res.json();
+    isAdmin = data.is_admin;
+    const badge = document.getElementById('admin-badge');
+    if (isAdmin) {
+      badge.className = 'admin-badge is-admin';
+      badge.textContent = '🛡️ Administrator';
+      badge.onclick = null;
+      badge.title   = '';
+    } else {
+      badge.className = 'admin-badge no-admin';
+      badge.textContent = '⚠ Not Administrator — click to elevate';
+      badge.onclick = requestAdmin;
+      badge.title = 'Click to re-launch as Administrator';
+    }
+    updateScopeHint();
+  } catch(_) {}
+}
+
+async function requestAdmin() {
+  try {
+    await fetch('/request-admin', { method: 'POST' });
+    showToast('🛡️ Relaunching as Administrator…', 3000);
+  } catch(e) {
+    showToast('⚠ Could not elevate: ' + e.message, 3000);
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+// Install scope
+// ════════════════════════════════════════════════════════════
+function setScope(scope) {
+  installScope = scope;
+  document.getElementById('scope-system-btn').classList.toggle('active', scope === 'system');
+  document.getElementById('scope-user-btn').classList.toggle('active',   scope === 'user');
+  localStorage.setItem('fd-scope', scope);
+  updateScopeHint();
+}
+
+function updateScopeHint() {
+  const hint = document.getElementById('scope-hint');
+  if (installScope === 'system') {
+    if (isAdmin) {
+      hint.textContent = '✓ Admin rights confirmed';
+      hint.className = 'scope-hint ok';
+    } else {
+      hint.textContent = '⚠ Requires Administrator — fonts may install to user folder as fallback';
+      hint.className = 'scope-hint warn';
+    }
+  } else {
+    hint.textContent = 'No admin rights required · fonts active after re-login';
+    hint.className = 'scope-hint';
+  }
+}
+
+// Restore scope from localStorage
+(function(){
+  const s = localStorage.getItem('fd-scope');
+  if (s === 'user') setScope('user');
+})();
 
 // ════════════════════════════════════════════════════════════
 // Tabs
@@ -1326,8 +1544,6 @@ dz.addEventListener('drop', e=>{
   if (files.length) handleFiles(files);
 });
 
-// Clicking anywhere on the drop zone opens file picker,
-// EXCEPT when clicking a chip remove button, the chip itself, or the clear-all button
 dz.addEventListener('click', e => {
   if (e.target.closest('.zip-chip-remove') || e.target.closest('.zip-chip')) return;
   if (e.target.closest('#btn-clear-zips'))  return;
@@ -1351,7 +1567,6 @@ async function handleFiles(files) {
   document.getElementById('scanning').classList.add('active');
   document.getElementById('results').classList.remove('visible');
 
-  // add names (deduplicate)
   files.forEach(f=>{ if(!loadedZipNames.includes(f.name)) loadedZipNames.push(f.name); });
   renderZipChips();
 
@@ -1363,9 +1578,7 @@ async function handleFiles(files) {
     const data = await res.json();
     if (data.error) { alert('Scan error: '+data.error); resetInstall(); return; }
 
-    // merge with existing fonts from other ZIPs
     allFonts = [...allFonts, ...data.fonts];
-    // auto-select new fonts
     data.fonts.forEach((_,i) => selectedFonts.add(allFonts.length - data.fonts.length + i));
 
     document.getElementById('font-count').textContent = allFonts.length;
@@ -1389,26 +1602,20 @@ function renderZipChips() {
             title="Remove this ZIP">✕</span>
     </div>
   `).join('');
-  
   const btn = document.getElementById('btn-clear-zips');
   btn.classList.toggle('visible', loadedZipNames.length > 0);
 }
 
 function removeZip(name) {
-  // 1. Remove from the name tracking list
   loadedZipNames = loadedZipNames.filter(n => n !== name);
-
-  // 2. Notify backend to clear memory
   fetch('/remove-zip', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({name})
   });
 
-  // 3. Filter fonts and RE-MAP the selection indices
   const newFonts = [];
   const oldToNewMap = {};
-
   allFonts.forEach((font, oldIdx) => {
     if (font.source_zip !== name) {
       oldToNewMap[oldIdx] = newFonts.length;
@@ -1418,30 +1625,19 @@ function removeZip(name) {
 
   const newSelected = new Set();
   selectedFonts.forEach(oldIdx => {
-    if (oldToNewMap[oldIdx] !== undefined) {
-      newSelected.add(oldToNewMap[oldIdx]);
-    }
+    if (oldToNewMap[oldIdx] !== undefined) newSelected.add(oldToNewMap[oldIdx]);
   });
 
-  // 4. Update state
   allFonts = newFonts;
   selectedFonts = newSelected;
 
-  // 5. Reset pinned preview if it belonged to the removed ZIP
   if (pinnedPreviewIdx !== null && allFonts[pinnedPreviewIdx]?.source_zip === name) {
-    pinnedPreviewIdx = null;
-    pinnedPanelHTML = '';
+    pinnedPreviewIdx = null; pinnedPanelHTML = '';
   }
 
-  // 6. Refresh UI
   document.getElementById('font-count').textContent = allFonts.length;
-  renderZipChips();
-  renderList();
-  updateCount();
-
-  if (allFonts.length === 0) {
-    document.getElementById('results').classList.remove('visible');
-  }
+  renderZipChips(); renderList(); updateCount();
+  if (allFonts.length === 0) document.getElementById('results').classList.remove('visible');
 }
 
 function clearAllZips() {
@@ -1458,6 +1654,9 @@ function getVisible() {
     .filter(f => !q || f.name.toLowerCase().includes(q) || f.zip_path.toLowerCase().includes(q));
 }
 
+// visible list order (populated in renderList, used by keyboard nav)
+let _visibleOrder = [];
+
 function renderList() {
   const visible  = getVisible();
   const sortBy   = document.getElementById('sort-select').value;
@@ -1467,7 +1666,8 @@ function renderList() {
   if (sortBy==='size') sorted.sort((a,b)=>b.size_kb-a.size_kb);
   if (sortBy==='type') sorted.sort((a,b)=>a.ext.localeCompare(b.ext));
 
-  // Group
+  _visibleOrder = sorted.map(f => f._idx);
+
   const groups = {};
   sorted.forEach(f=>{
     let key;
@@ -1488,11 +1688,15 @@ function renderList() {
   for (const [group, fonts] of Object.entries(groups)) {
     html += `<div class="group-header">${group} · ${fonts.length}</div>`;
     fonts.forEach(f=>{
-      const sel = selectedFonts.has(f._idx);
+      const sel    = selectedFonts.has(f._idx);
       const extCls = ['TTF','OTF','WOFF','WOFF2'].includes(f.ext) ? f.ext : 'other';
       const isOpen = pinnedPreviewIdx === f._idx;
+      const kbCls  = kbFocusedIdx === f._idx ? ' kb-focused' : '';
       html += `
-        <div class="font-item ${sel?'checked':''}" onclick="toggleFont(${f._idx})" data-idx="${f._idx}">
+        <div class="font-item ${sel?'checked':''}${kbCls}" 
+             onclick="toggleFont(${f._idx})" 
+             data-idx="${f._idx}"
+             tabindex="-1">
           <div class="cb-box">${sel?'✓':''}</div>
           <div class="font-meta">
             <div class="font-filename">${escHtml(f.name)}</div>
@@ -1500,7 +1704,7 @@ function renderList() {
           </div>
           <span class="ext-badge ext-${extCls}">${f.ext}</span>
           <div class="font-size">${f.size_kb} KB</div>
-          <button class="preview-btn ${isOpen?'active-eye':''}" onclick="togglePinnedPreview(${f._idx});event.stopPropagation();" title="Pin preview">👁️</button>
+          <button class="preview-btn ${isOpen?'active-eye':''}" onclick="togglePinnedPreview(${f._idx});event.stopPropagation();" title="Pin preview [P]">👁️</button>
           <div class="hover-preview-tip" id="hpt-${f._idx}">Loading…</div>
         </div>
         <div id="pinned-panel-${f._idx}" style="display:${isOpen?'block':'none'}; padding:0 16px;"></div>`;
@@ -1509,7 +1713,7 @@ function renderList() {
   if (!html) html = '<div class="empty-state">No fonts match your search</div>';
   document.getElementById('font-list').innerHTML = html;
 
-  // Restore open pinned panel after re-render
+  // Restore pinned panel
   if (pinnedPreviewIdx !== null) {
     const panel = document.getElementById(`pinned-panel-${pinnedPreviewIdx}`);
     if (panel && pinnedPanelHTML) {
@@ -1517,6 +1721,12 @@ function renderList() {
       panel.innerHTML = pinnedPanelHTML;
       restoreInlinePanelEvents(pinnedPreviewIdx);
     }
+  }
+
+  // Scroll kb-focused item into view
+  if (kbFocusedIdx !== null) {
+    const el = document.querySelector(`[data-idx="${kbFocusedIdx}"]`);
+    if (el) el.scrollIntoView({ block: 'nearest' });
   }
 
   // Wire hover tips
@@ -1574,20 +1784,103 @@ function updateCount() {
 }
 
 // ════════════════════════════════════════════════════════════
+// Keyboard navigation
+// ════════════════════════════════════════════════════════════
+document.addEventListener('keydown', e => {
+  // Don't hijack when typing in any input/textarea
+  const tag = document.activeElement?.tagName;
+  const inInput = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+
+  // Ctrl+A / Ctrl+D always active (not in input)
+  if (!inInput && e.ctrlKey && e.key === 'a') {
+    e.preventDefault();
+    selectAll();
+    showToast(`✓ Selected all ${allFonts.length} fonts`);
+    return;
+  }
+  if (!inInput && e.ctrlKey && e.key === 'd') {
+    e.preventDefault();
+    selectNone();
+    showToast('✓ Deselected all');
+    return;
+  }
+
+  // Only proceed with list-nav shortcuts when install tab is visible
+  // and font list is showing
+  const resultsVisible = document.getElementById('results').classList.contains('visible');
+  if (!resultsVisible) return;
+
+  // Enter = install
+  if (!inInput && e.key === 'Enter') {
+    e.preventDefault();
+    if (!document.getElementById('install-btn').disabled) installFonts();
+    return;
+  }
+
+  // Escape = close pinned preview
+  if (e.key === 'Escape') {
+    if (pinnedPreviewIdx !== null) { closePinnedPreview(); return; }
+  }
+
+  // Arrow navigation — only when list is focused and not in input
+  if (!inInput && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+    e.preventDefault();
+    if (_visibleOrder.length === 0) return;
+
+    if (kbFocusedIdx === null) {
+      kbFocusedIdx = _visibleOrder[0];
+    } else {
+      const pos = _visibleOrder.indexOf(kbFocusedIdx);
+      if (e.key === 'ArrowDown') {
+        kbFocusedIdx = _visibleOrder[Math.min(pos + 1, _visibleOrder.length - 1)];
+      } else {
+        kbFocusedIdx = _visibleOrder[Math.max(pos - 1, 0)];
+      }
+    }
+    renderList();
+    return;
+  }
+
+  // Space = toggle focused font
+  if (!inInput && e.key === ' ') {
+    e.preventDefault();
+    if (kbFocusedIdx !== null) {
+      toggleFont(kbFocusedIdx);
+      const n = selectedFonts.has(kbFocusedIdx) ? 'Selected' : 'Deselected';
+      showToast(`${n}: ${allFonts[kbFocusedIdx]?.name}`);
+    }
+    return;
+  }
+
+  // P = toggle pinned preview on focused font
+  if (!inInput && e.key === 'p') {
+    if (kbFocusedIdx !== null) togglePinnedPreview(kbFocusedIdx);
+    return;
+  }
+
+  // Click on font list area to enable keyboard nav
+  // (sets kbFocusedIdx to first visible item if none focused)
+});
+
+// Clicking a font item also sets it as kb-focused
+document.getElementById('font-list').addEventListener('click', e => {
+  const item = e.target.closest('.font-item');
+  if (item) {
+    kbFocusedIdx = parseInt(item.dataset.idx);
+    // don't re-render here — toggleFont already calls renderList
+  }
+});
+
+// ════════════════════════════════════════════════════════════
 // Inline sticky preview panel (eye button)
 // ════════════════════════════════════════════════════════════
 async function togglePinnedPreview(idx) {
   if (pinnedPreviewIdx === idx) {
-    // Close it
-    pinnedPreviewIdx = null;
-    pinnedPanelHTML  = '';
-    renderList();
-    return;
+    pinnedPreviewIdx = null; pinnedPanelHTML = ''; renderList(); return;
   }
   pinnedPreviewIdx = idx;
   pinnedPanelSize  = 32;
-
-  renderList(); // re-render so panel slot appears
+  renderList();
 
   const panel = document.getElementById(`pinned-panel-${idx}`);
   if (!panel) return;
@@ -1602,7 +1895,7 @@ async function togglePinnedPreview(idx) {
                  value="${escHtml(document.getElementById('global-preview-text').value || 'The quick brown fox')}"
                  placeholder="Type preview text…" oninput="updateInlinePreview(${idx})" />
         </div>
-        <button class="inline-preview-close" onclick="closePinnedPreview()" title="Close">✕</button>
+        <button class="inline-preview-close" onclick="closePinnedPreview()" title="Close [Esc]">✕</button>
       </div>
       <div class="inline-preview-display" id="ipd-${idx}">⏳ Loading…</div>
       <div class="inline-preview-sizes">
@@ -1614,7 +1907,6 @@ async function togglePinnedPreview(idx) {
   pinnedPanelHTML = panel.innerHTML;
   restoreInlinePanelEvents(idx);
 
-  // load font
   const display = document.getElementById(`ipd-${idx}`);
   try {
     const family = `FDHover_${idx}`;
@@ -1635,7 +1927,6 @@ async function togglePinnedPreview(idx) {
 }
 
 function restoreInlinePanelEvents(idx) {
-  // After innerHTML is set, wire up live events that were lost
   const inp = document.getElementById(`ipt-${idx}`);
   if (inp) {
     inp.addEventListener('input', () => updateInlinePreview(idx));
@@ -1650,7 +1941,6 @@ function updateInlinePreview(idx) {
   const input   = document.getElementById(`ipt-${idx}`);
   if (!display || !input) return;
   display.textContent = input.value || 'Type something…';
-  // keep pinnedPanelHTML fresh so re-render restores the latest text
   const panel = document.getElementById(`pinned-panel-${idx}`);
   if (panel) pinnedPanelHTML = panel.innerHTML;
 }
@@ -1667,67 +1957,7 @@ function setInlineSize(idx, s) {
 }
 
 function closePinnedPreview() {
-  pinnedPreviewIdx = null;
-  pinnedPanelHTML  = '';
-  renderList();
-}
-
-// ════════════════════════════════════════════════════════════
-// Font preview modal (kept for legacy / fallback)
-// ════════════════════════════════════════════════════════════
-async function openPreview(idx) {
-  previewFontIdx = idx;
-  const font = allFonts[idx];
-  document.getElementById('preview-font-name').textContent = font.name;
-  document.getElementById('preview-font-sub').textContent  = `${font.ext} · ${font.size_kb} KB · ${font.source_zip}`;
-  document.getElementById('preview-text-input').value = document.getElementById('global-preview-text').value;
-
-  const display = document.getElementById('preview-display');
-  display.textContent = 'Loading preview…';
-  display.style.fontFamily = 'inherit';
-  previewFontLoaded = false;
-
-  document.getElementById('preview-modal').classList.add('active');
-
-  try {
-    const res  = await fetch(`/preview?source=${encodeURIComponent(font.source_zip)}&path=${encodeURIComponent(font.zip_path)}`);
-    const data = await res.json();
-    if (data.error) { display.textContent = '⚠ Preview not available: '+data.error; return; }
-
-    // Remove any previously loaded preview font
-    document.fonts.forEach(f=>{ if(f.family==='FDPreview') { try{document.fonts.delete(f);}catch(_){} } });
-
-    const ff = new FontFace('FDPreview', `url(data:font/ttf;base64,${data.base64})`);
-    await ff.load();
-    document.fonts.add(ff);
-
-    previewFontLoaded = true;
-    display.style.fontFamily = 'FDPreview, sans-serif';
-    display.style.fontSize   = previewSize+'px';
-    display.textContent = document.getElementById('preview-text-input').value;
-  } catch(e) {
-    display.textContent = '⚠ Preview error: '+e.message;
-  }
-}
-
-function closePreview(e) {
-  if (!e || e.target.id==='preview-modal') {
-    document.getElementById('preview-modal').classList.remove('active');
-  }
-}
-
-function updatePreviewText() {
-  if (!previewFontLoaded) return;
-  document.getElementById('preview-display').textContent =
-    document.getElementById('preview-text-input').value || 'Type something above…';
-}
-
-function setPreviewSize(s) {
-  previewSize = s;
-  document.querySelectorAll('.size-btn').forEach(b=>{
-    b.classList.toggle('active', parseInt(b.textContent)===s);
-  });
-  document.getElementById('preview-display').style.fontSize = s+'px';
+  pinnedPreviewIdx = null; pinnedPanelHTML = ''; renderList();
 }
 
 // ════════════════════════════════════════════════════════════
@@ -1745,7 +1975,7 @@ function exportList() {
 }
 
 // ════════════════════════════════════════════════════════════
-// Install — with progress bar
+// Install — with progress bar + scope
 // ════════════════════════════════════════════════════════════
 async function installFonts() {
   if (!selectedFonts.size) return;
@@ -1758,24 +1988,18 @@ async function installFonts() {
   const total    = selectedFonts.size;
   const fontsArr = Array.from(selectedFonts).map(i => allFonts[i]);
 
-  // Show progress UI
   btn.disabled = true;
   btn.textContent = '⏳ Installing…';
   document.getElementById('install-result').classList.remove('visible');
   wrap.classList.add('visible');
-  document.getElementById('install-progress-label') && (document.querySelector('.install-progress-label').textContent = `⚡ Installing ${total} font${total>1?'s':''}…`);
   bar.style.width = '0%';
   countEl.textContent = `0 / ${total}`;
   statusEl.className = 'install-progress-status';
   statusEl.textContent = 'Sending to installer…';
-
-  // Animate bar to 15% immediately to show activity
   setTimeout(() => { bar.style.width = '15%'; }, 50);
 
   try {
-    // Simulate per-font progress via chunked installs (batches of 5)
     const batchSize = 5;
-    let installed = 0;
     let allResults = { success: [], skipped: [], failed: [] };
 
     for (let i = 0; i < fontsArr.length; i += batchSize) {
@@ -1785,7 +2009,7 @@ async function installFonts() {
       const res  = await fetch('/install', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fonts: batch })
+        body: JSON.stringify({ fonts: batch, scope: installScope })
       });
       const data = await res.json();
 
@@ -1794,24 +2018,26 @@ async function installFonts() {
       if (data.failed)   allResults.failed.push(...data.failed);
       if (data.note && !allResults.note) allResults.note = data.note;
       if (data.error)    allResults.error = data.error;
+      // Record what scope was actually used (backend may override)
+      if (data.actual_scope && !allResults.actual_scope) allResults.actual_scope = data.actual_scope;
 
-      installed = Math.min(i + batchSize, fontsArr.length);
+      const installed = Math.min(i + batchSize, fontsArr.length);
       const pct = Math.round((installed / total) * 100);
       bar.style.width = Math.max(pct, 18) + '%';
       countEl.textContent = `${Math.min(installed, total)} / ${total}`;
     }
 
-    // Finish
     bar.style.width = '100%';
     countEl.textContent = `${total} / ${total}`;
     const ok = allResults.success.length, sk = allResults.skipped.length, fl = allResults.failed.length;
     statusEl.className = 'install-progress-status done';
-    statusEl.textContent = `✅ Done — ${ok} installed${sk ? `, ${sk} skipped` : ''}${fl ? `, ${fl} failed` : ''}`;
+    const scopeLabel = allResults.actual_scope === 'user' ? '👤 User' : '🔒 System';
+    statusEl.textContent = `✅ Done [${scopeLabel}] — ${ok} installed${sk ? `, ${sk} skipped` : ''}${fl ? `, ${fl} failed` : ''}`;
 
     setTimeout(() => {
       wrap.classList.remove('visible');
       bar.style.width = '0%';
-    }, 3200);
+    }, 3800);
 
     showInstallResult(allResults);
     loadInstalledFonts();
@@ -1826,10 +2052,13 @@ async function installFonts() {
 }
 
 function showInstallResult(data) {
+  const scopeTag = data.actual_scope
+    ? `<span class="history-scope-tag ${data.actual_scope}">${data.actual_scope === 'system' ? '🔒 System' : '👤 User'}</span>`
+    : '';
   let html = '';
   if (data.success?.length) html += `
     <div class="result-section success-section">
-      <h3>✅ Installed (${data.success.length})</h3>
+      <h3>✅ Installed (${data.success.length}) ${scopeTag}</h3>
       <ul class="result-list">${data.success.map(n=>`<li>${escHtml(n)}</li>`).join('')}</ul>
     </div>`;
   if (data.skipped?.length) html += `
@@ -1890,21 +2119,16 @@ function filterInstalled() {
   renderInstalledList();
 }
 
-
 async function uninstallFont(name, location) {
   if (!confirm(`Uninstall "${name}"?`)) return;
   try {
     const res  = await fetch('/uninstall', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
+      method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({name, location})
     });
     const data = await res.json();
-    if (data.success) {
-      loadInstalledFonts();
-    } else {
-      alert('Uninstall failed: '+(data.error||'unknown error'));
-    }
+    if (data.success) { loadInstalledFonts(); }
+    else { alert('Uninstall failed: '+(data.error||'unknown error')); }
   } catch(e) { alert('Error: '+e.message); }
 }
 
@@ -1916,16 +2140,21 @@ async function loadHistory() {
     const res  = await fetch('/history');
     const data = await res.json();
     const history = (data.history||[]).slice().reverse();
-    const html = history.map(e=>`
+    const html = history.map(e=>{
+      const scopeTag = e.scope
+        ? `<span class="history-scope-tag ${e.scope}">${e.scope==='system'?'🔒 System':'👤 User'}</span>`
+        : '';
+      return `
       <div class="history-item">
         <div class="history-header">
-          <div class="history-source">📦 ${escHtml(e.source)}</div>
+          <div class="history-source">📦 ${escHtml(e.source)} ${scopeTag}</div>
           <div class="history-date">${new Date(e.timestamp).toLocaleString()}</div>
         </div>
         <div class="history-fonts">
           ${e.count} font${e.count>1?'s':''}: ${e.fonts.slice(0,6).map(escHtml).join(', ')}${e.fonts.length>6?' …':''}
         </div>
-      </div>`).join('');
+      </div>`;
+    }).join('');
     document.getElementById('history-list').innerHTML =
       html || '<div class="empty-state">No installation history yet</div>';
   } catch(e) {
@@ -1944,7 +2173,8 @@ async function clearHistory() {
 // Reset install tab
 // ════════════════════════════════════════════════════════════
 function resetInstall() {
-  loadedZipNames = []; allFonts = []; selectedFonts.clear(); searchQuery='';
+  loadedZipNames = []; allFonts = []; selectedFonts.clear();
+  searchQuery=''; kbFocusedIdx=null;
   pinnedPreviewIdx = null; pinnedPanelHTML = '';
   document.getElementById('zip-chips').innerHTML  = '';
   const btn = document.getElementById('btn-clear-zips');
@@ -1953,11 +2183,13 @@ function resetInstall() {
   document.getElementById('results').classList.remove('visible');
   document.getElementById('install-result').classList.remove('visible');
   document.getElementById('zip-input').value = '';
+  fetch('/reset', { method: 'POST' });
 }
 
 // ════════════════════════════════════════════════════════════
 // Init
 // ════════════════════════════════════════════════════════════
+checkAdminStatus();
 loadInstalledFonts();
 </script>
 </body>
@@ -1966,14 +2198,13 @@ loadInstalledFonts();
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# HTTP handler — ALL routes live here
+# HTTP handler
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
-        pass  # silence server logs
+        pass
 
-    # ── GET ──────────────────────────────────────────────────────────────────
     def do_GET(self):
         parsed = urlparse(self.path)
         path   = parsed.path
@@ -1984,12 +2215,15 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == '/installed':
-            fonts = list_installed_fonts()
-            self._json({"fonts": fonts})
+            self._json({"fonts": list_installed_fonts()})
             return
 
         if path == '/history':
             self._json({"history": get_install_history()})
+            return
+
+        if path == '/admin-status':
+            self._json(get_admin_status())
             return
 
         if path == '/preview':
@@ -2001,15 +2235,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             try:
                 data = extract_font_bytes(zb, fpath)
-                b64  = base64.b64encode(data).decode()
-                self._json({"base64": b64})
+                self._json({"base64": base64.b64encode(data).decode()})
             except Exception as e:
                 self._json({"error": str(e)}, 500)
             return
 
         self._json({"error": "Not found"}, 404)
 
-    # ── POST ─────────────────────────────────────────────────────────────────
     def do_POST(self):
         global _zip_data_list, _found_fonts
         parsed = urlparse(self.path)
@@ -2017,7 +2249,6 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get('Content-Length', 0))
         body   = self.rfile.read(length)
 
-        # ── /scan ─────────────────────────────────────────────────────────────
         if path == '/scan':
             ct    = self.headers.get('Content-Type', '')
             pairs = parse_multipart_zips(ct, body)
@@ -2026,7 +2257,6 @@ class Handler(BaseHTTPRequestHandler):
                 return
             all_fonts = []
             for fname, zb in pairs:
-                # Store / update in global list
                 _zip_data_list = [(n, d) for n, d in _zip_data_list if n != fname]
                 _zip_data_list.append((fname, zb))
                 try:
@@ -2039,7 +2269,6 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"fonts": all_fonts, "count": len(all_fonts)})
             return
 
-        # ── /install ──────────────────────────────────────────────────────────
         if path == '/install':
             try:
                 payload = json.loads(body)
@@ -2047,48 +2276,58 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "Invalid JSON"}, 400)
                 return
             fonts = payload.get('fonts', [])
+            scope = payload.get('scope', 'system')   # 'system' or 'user'
             if not fonts:
                 self._json({"error": "No fonts specified"}, 400)
                 return
             if sys.platform != 'win32':
                 self._json({"error": "Font installation is Windows-only."})
                 return
-            try:
-                results = install_fonts_windows(fonts)
-            except PermissionError:
-                results = install_fonts_fallback(fonts)
-                results['note'] = ('Installed to user fonts folder (no admin rights). '
-                                   'Fonts will be active after you log out and back in.')
-            except Exception as e:
-                if 'Access' in str(e) or 'Permission' in str(e):
-                    results = install_fonts_fallback(fonts)
-                    results['note'] = ('Installed to user fonts folder (no admin rights). '
-                                       'Fonts will be active after you log out and back in.')
-                else:
-                    self._json({"error": str(e)}, 500)
-                    return
+
+            # Try the requested scope; fall back to user if permission denied
+            results = install_fonts_windows(fonts, scope)
+            actual_scope = scope
+
+            # If system install failed with permission errors, fall back to user
+            if scope == 'system' and results.get('failed') and \
+               any('Permission' in (f.get('reason','')) for f in results['failed']):
+                fallback = install_fonts_windows(
+                    [f_item for f_item in fonts
+                     if Path(f_item.get('zip_path', '')).name
+                        not in results.get('success', [])],
+                    'user'
+                )
+                # Merge results
+                results['success'] = results.get('success', []) + fallback.get('success', [])
+                results['skipped'] = results.get('skipped', []) + fallback.get('skipped', [])
+                results['failed']  = [f for f in results.get('failed', [])
+                                      if 'Permission' not in f.get('reason', '')]
+                results['failed'] += fallback.get('failed', [])
+                actual_scope = 'user'
+                results['note'] = (
+                    'Some fonts installed to your user fonts folder because system install '
+                    'requires Administrator rights. They will be active after re-login.'
+                )
+
+            results['actual_scope'] = actual_scope
             self._json(results)
             return
 
-        # ── /uninstall ────────────────────────────────────────────────────────
         if path == '/uninstall':
             try:
                 payload = json.loads(body)
             except Exception:
                 self._json({"error": "Invalid JSON"}, 400)
                 return
-            result = uninstall_font(payload.get('name', ''), payload.get('location', 'user'))
-            self._json(result)
+            self._json(uninstall_font(payload.get('name', ''), payload.get('location', 'user')))
             return
 
-        # ── /history/clear ────────────────────────────────────────────────────
         if path == '/history/clear':
             if _history_file.exists():
                 _history_file.write_text('[]', encoding='utf-8')
             self._json({"ok": True})
             return
 
-        # ── /remove-zip ───────────────────────────────────────────────────────
         if path == '/remove-zip':
             try:
                 payload = json.loads(body)
@@ -2100,9 +2339,21 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True})
             return
 
+        if path == '/reset':
+            _zip_data_list.clear()
+            _found_fonts.clear()
+            self._json({"ok": True})
+            return
+
+        if path == '/request-admin':
+            # Re-attempt elevation from within the running process
+            if sys.platform == 'win32':
+                threading.Thread(target=_relaunch_as_admin, daemon=True).start()
+            self._json({"ok": True})
+            return
+
         self._json({"error": "Not found"}, 404)
 
-    # ── helpers ───────────────────────────────────────────────────────────────
     def _json(self, data, code=200):
         body = json.dumps(data).encode()
         self.send_response(code)
@@ -2139,7 +2390,7 @@ def main():
 
     PORT = 7432
     start_server(PORT)
-    time.sleep(0.5)   # let server bind before the window opens
+    time.sleep(0.5)
 
     webview.create_window(
         title      = "FontDrop",
@@ -2148,7 +2399,7 @@ def main():
         height     = 740,
         min_size   = (680, 500),
         resizable  = True,
-        fullscreen = True,   # launches in true fullscreen; user can press F11 to toggle
+        fullscreen = True,
     )
     webview.start()
 
